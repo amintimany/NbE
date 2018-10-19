@@ -1,5 +1,94 @@
-From stdpp Require Import base list proof_irrel.
+From Coq.ssr Require Export ssreflect.
+Global Set SsrOldRewriteGoalsOrder.
+From stdpp Require Import base list option proof_irrel.
 From Autosubst Require Import Autosubst.
+
+Ltac done := stdpp.tactics.done.
+
+Section Autosubst_Lemmas.
+  Context {term : Type} {Ids_term : Ids term}
+          {Rename_term : Rename term} {Subst_term : Subst term}
+          {SubstLemmas_term : SubstLemmas term}.
+
+  Lemma iter_up (m x : nat) (f : var → term) :
+    upn m f x = match lt_dec x m with left _ => ids x | right _ => rename (+m) (f (x - m)) end.
+  Proof.
+    revert x; induction m as [|m IH]; intros [|x];
+      repeat (case_match || asimpl || rewrite IH); auto with omega.
+  Qed.
+End Autosubst_Lemmas.
+
+Definition f_equal {A B} (f : A → B) {x y : A} : x = y → f x = f y :=
+  λ H, match H in _ = u return f x = f u with eq_refl => eq_refl end.
+
+Program Definition Some_inj {A} : Inj (=) (=) (@Some A) :=
+  λ x y H, f_equal (λ u, match u with Some w => w | None => x end) H.
+
+Section list_ops.
+  Context {A : Type}.
+
+  Lemma reverse_involutive (l : list A) : reverse (reverse l) = l.
+  Proof.
+    rewrite /reverse.
+    change l with (rev_append [] l) at 2.
+    generalize (@nil A) at 1 3 as z.
+    induction l; intros z; trivial.
+    simpl; rewrite IHl; trivial.
+  Defined.
+
+  Lemma reverse_append_nil (l w z : list A) :
+    rev_append l (w ++ z) = rev_append l w ++ z.
+  Proof.
+    revert w z; induction l; intros w z; rewrite //= (IHl (_ :: _)) //.
+  Defined.
+
+  Lemma reverse_app (l1 l2 : list A) :
+    reverse (l1 ++ l2) = reverse l2 ++ reverse l1.
+  Proof.
+    rewrite /reverse.
+    generalize (@nil A) at 1 3 as z.
+    revert l2; induction l1; intros l2 z; simpl.
+    - apply (reverse_append_nil _ []).
+    - rewrite IHl1 //.
+  Defined.
+
+  Context `{EqDecision A}.
+
+  Fixpoint take_postfix (pre l: list A) : option (list A) :=
+    match pre with
+    | [] => Some l
+    | x :: pre' =>
+      match l with
+      | [] => None
+      | a :: l' => if decide (a = x) is left _ then take_postfix pre' l' else None
+      end
+    end.
+
+  Lemma take_postfix_post pre l post :
+    take_postfix pre l = Some post → l = pre ++ post.
+  Proof.
+    revert l post; induction pre as [|x pre];
+      intros l post; first by inversion 1.
+    destruct l as [|z l]; first by inversion 1.
+    simpl; destruct decide; last by inversion 1.
+    inversion 1; simplify_eq; apply f_equal. by apply IHpre.
+  Defined.
+
+  Definition take_prefix (pre l: list A) : option (list A) :=
+    (take_postfix (reverse pre) (reverse l)) ≫= (λ x, Some (reverse x)).
+
+  Lemma take_prefix_pre post l pre :
+    take_prefix post l = Some pre → l = pre ++ post.
+  Proof.
+    rewrite /take_prefix.
+    destruct (take_postfix (reverse post) (reverse l)) as [p|] eqn:Heq;
+      last done.
+    simpl; inversion 1; subst.
+    rewrite -(reverse_involutive l) -(reverse_involutive post) -reverse_app.
+    by apply f_equal; apply take_postfix_post.
+  Defined.
+
+End list_ops.
 
 Inductive term : Type :=
 | Var : var → term
@@ -30,16 +119,16 @@ Inductive type : Type :=
   Un
 | Arr : type → type → type.
 
+Global Instance type_eqdec : EqDecision type.
+Proof.
+  intros ? ?; unfold Decision. decide equality.
+Defined.
+
 Fixpoint type_interp `{!Base_Domain} (T : type) : Type :=
   match T with
   | Un => UnitDom
   | Arr W W' => (type_interp W) → (type_interp W')
   end.
-
-Global Instance type_eqdec : EqDecision type.
-Proof.
-  intros ? ?; unfold Decision. decide equality.
-Qed.
 
 Definition ctx := list type.
 
@@ -48,12 +137,6 @@ Fixpoint ctx_interp `{!Base_Domain} Γ : Type :=
   | [] => Datatypes.unit
   | T :: Γ' => (type_interp T) * ctx_interp Γ'
   end.
-
-Definition f_equal {A B} (f : A → B) {x y : A} : x = y → f x = f y :=
-  λ H, match H in _ = u return f x = f u with eq_refl => eq_refl end.
-
-Program Definition Some_inj {A} : Inj (=) (=) (@Some A) :=
-  λ x y H, f_equal (λ u, match u with Some w => w | None => x end) H.
 
 Program Fixpoint var_interp `{!Base_Domain, !Base_Elems}
         Γ (ρ : ctx_interp Γ) (x : var) T :
@@ -133,7 +216,6 @@ Program Fixpoint term_interp `{!Base_Domain, !Base_Elems}
                   end
                ) _
   end.
-
 
 Next Obligation.
 Proof. by intros ? ? ? ? ? ? ? Htp; inversion Htp; subst. Defined.
@@ -216,7 +298,7 @@ Defined.
 
 Inductive NF : ctx → term → type → Prop :=
   NF_unit Γ : NF Γ un Un
-| NE_NF Γ t Unit : NE Γ t Unit → NF Γ t Unit
+| NE_NF Γ t : NE Γ t Un → NF Γ t Un
 | NF_Lam Γ t S T : NF (S :: Γ) t T → NF Γ (Lam t) (Arr S T)
 with
 NE : ctx → term → type → Prop :=
@@ -224,68 +306,139 @@ NE : ctx → term → type → Prop :=
 | NE_App Γ t t' S T : NE Γ t (Arr S T) → NF Γ t' S → NE Γ (App t t') T
 .
 
+Lemma NF_lift Ξ Δ Γ t T :
+  NF (Ξ ++ Γ) t T → NF (Ξ ++ Δ ++ Γ) t.[upn (length Ξ) (ren (+(length Δ)))] T
+with
+NE_lift Ξ Δ Γ t T :
+  NE (Ξ ++ Γ) t T → NE (Ξ ++ Δ ++ Γ) t.[upn (length Ξ) (ren (+(length Δ)))] T.
+Proof.
+  - intros HNF. remember (Ξ ++ Γ) as ξ. revert Ξ Γ Heqξ.
+    induction HNF => Ξ Γ' Heqξ.
+    + apply NF_unit.
+    + apply NE_NF. apply NE_lift. rewrite -Heqξ //.
+    + simpl. apply NF_Lam.
+      apply (IHHNF (_ :: _)).
+      rewrite Heqξ //.
+  - intros HNF. remember (Ξ ++ Γ) as ξ. revert Ξ Γ Heqξ.
+    induction HNF as [? x ? Hlu|] => Ξ Γ' Heqξ.
+    + subst.
+      asimpl. rewrite iter_up.
+      destruct lt_dec.
+      * apply NE_var.
+        rewrite lookup_app_l // in Hlu.
+        rewrite lookup_app_l //.
+      * rewrite lookup_app_r in Hlu; last eauto with omega.
+        apply NE_var; simpl.
+        rewrite lookup_app_r; last eauto with omega.
+        replace (length Ξ + (length Δ + (x - length Ξ)) - length Ξ) with
+               ((length Δ + x - length Ξ)) by omega.
+        rewrite lookup_app_r; last eauto with omega.
+        replace (length Δ + x - length Ξ - length Δ) with (x - length Ξ)
+          by omega.
+        trivial.
+    + subst.
+      eapply NE_App; eauto.
+Qed.
+
 Definition NFtype T := ∀ Γ, sigT (λ t, NF Γ t T).
-Definition NEtype T := ∀ Γ, option (sigT (λ t, NE Γ t T)).
+Definition NEtype T := ∀ Γ, option (sigT (λ t, NE Γ t T))%type.
 
 Definition NFinterp (T : type) : Type :=
   let _ := {| UnitDom := (NFtype Un) |} in
   type_interp T.
 
-Program Definition NE_variable T (x : var) : NEtype T :=
-  λ Γ,
-  match Γ !! x as u return Γ !! x = u → option (sigT (λ t, NE Γ t T)) with
-  | None => λ H, None
-  | Some U => λ H,
-    match decide (T = U) with
-    | left H' => Some (existT (Var x) (NE_var Γ x T _))
-    | right _ => None
+Definition NE_variable T (x : var) (Γ : ctx) :
+    Γ !! x = Some T → NEtype T :=
+  λ Hx Ξ,
+  match take_prefix Γ Ξ as u return
+        (match u return Type with
+        | None => unit
+        | Some z => z ++ Γ = Ξ
+        end) → option (sigT (λ t, NE Ξ t T))
+  with
+  | None => λ _, None
+  | Some Δ =>
+    λ H,
+    match H in _ = z return option (sigT (λ t, NE z t T)) with
+    | eq_refl => Some (existT _ (NE_lift [] Δ Γ _ _ (NE_var _ _ _ Hx)))
     end
-  end eq_refl.
-
-Next Obligation.
-Proof. intros; by destruct H'. Qed.
+  end
+    (match take_prefix Γ Ξ as u return
+           take_prefix Γ Ξ = u → (match u return Type with
+                                  | None => unit
+                                  | Some w => w ++ Γ = Ξ
+                                  end)
+     with
+     | None => λ _, ()
+     | Some z => λ H, eq_sym (take_prefix_pre _ _ _ H)
+     end eq_refl
+    ).
 
 Program Fixpoint reflect T (neT : NEtype T) : NFinterp T :=
   match T as U return NEtype U → NFinterp U with
   | Un => λ neT Γ,
            match neT Γ with
            | None => existT un (NF_unit Γ)
-           | Some s => existT (projT1 s) (NE_NF _ _ _ (projT2 s))
+           | Some s => existT (projT1 s)
+                             (NE_NF _ _ (projT2 s))
            end
   | Arr W W' =>
-    λ neT s,
+    λ neW s,
     reflect W'
-         (λ Γ, match neT Γ with
-                 | None => None
-                 | Some t =>
-                   Some
-                     (existT
-                        (App (projT1 t) (projT1 (reify W s Γ)))
-                        (NE_App _ _ _ _ _ (projT2 t) (projT2 (reify W s Γ))))
-               end)
+         (λ Γ,
+          match neW Γ with
+          | None => None
+          | Some t =>
+            Some
+              (existT
+                 (App (projT1 t)
+                      (projT1 (reify W s Γ)))
+                 (NE_App _ _ _ _ _ (projT2 t) (projT2 (reify W s Γ))))
+          end)
   end neT
 with
 reify T (t : NFinterp T) : NFtype T :=
   match T as U return NFinterp U → NFtype U with
   | Un => λ s, s
   | Arr W W' =>
-    λ f Γ, existT
-             (Lam (projT1
-                     (reify W' (f (reflect W (NE_variable W 0))) (W :: Γ))))
-             (NF_Lam _ _ _ _
-                     (projT2
-                        (reify W' (f (reflect W (NE_variable W 0))) (W :: Γ))))
+    λ f Γ,
+    existT
+      (Lam
+         (projT1
+            (reify
+               W'
+               (f (reflect W (NE_variable W 0 (W :: Γ) eq_refl))) (W :: Γ))))
+      (NF_Lam
+         _ _ _ _
+         (projT2
+            (reify
+               W'
+               (f (reflect W (NE_variable W 0 (W :: Γ) eq_refl))) (W :: Γ))))
   end t.
 
-Fixpoint reflect_ctx_rec Γ x :
+Program Fixpoint reflect_ctx_rec Γ Δ Ξ :
     let _ := {| UnitDom := (NFtype Un) |} in
-    ctx_interp Γ :=
-  match Γ as u return ctx_interp u with
-    | [] => ()
-    | T :: Γ' => (reflect T (NE_variable T x),(reflect_ctx_rec Γ' (S x)))
+    Γ = Δ ++ Ξ → ctx_interp Ξ :=
+  match Ξ as u return Γ = Δ ++ u → ctx_interp u with
+    | [] => λ _, ()
+    | T :: Ξ' => λ H, (reflect T (NE_variable T (length Δ) Γ _),
+                      (reflect_ctx_rec Γ (Δ ++ [T]) Ξ' _))
   end.
 
-Definition reflect_ctx Γ := reflect_ctx_rec Γ 0.
+Next Obligation.
+Proof.
+  intros Γ Δ Ξ T Γ' Heq; rewrite Heq; clear Γ Heq; revert T Γ'.
+  induction Δ; intros T Γ'; first trivial.
+  apply IHΔ.
+Defined.
+
+Next Obligation.
+Proof.
+  intros Γ Δ _ T Ξ' ->.
+  rewrite -assoc //.
+Defined.
+
+Definition reflect_ctx Γ := reflect_ctx_rec Γ [] Γ eq_refl.
 
 Definition interp_with_reflected_ctx {Γ t T} :
   typed Γ t T → @type_interp {| UnitDom := (NFtype Un) |} T :=
@@ -293,8 +446,7 @@ Definition interp_with_reflected_ctx {Γ t T} :
   let BE := Build_Base_Elems BD (λ Γ, existT un (NF_unit Γ)) in
   λ Htp, @term_interp BD BE _ (reflect_ctx Γ) _ _ Htp.
 
-
-Definition nf {Γ t T} (Htp : typed Γ t T) :=
+Definition nf {Γ t T} (Htp : typed Γ t T) : sigT (λ t, NF Γ t T) :=
   reify T (interp_with_reflected_ctx Htp) Γ.
 
 Definition ex_term := App (Lam (Var 0)) un.
@@ -305,4 +457,29 @@ Proof. repeat econstructor. Defined.
 Definition nf_ex_term := projT1 (nf ex_term_tp).
 
 Lemma nf_ex_term_correct : nf_ex_term = un.
+Proof. reflexivity. Qed.
+
+Definition ex2_term := App (Lam (App (Lam (Var 0)) (Var 0))) (Lam (Var 0)).
+
+Lemma ex2_term_tp : typed [] ex2_term (Arr Un Un).
+Proof. repeat econstructor. Defined.
+
+Definition nf_ex2_term := projT1 (nf ex2_term_tp).
+
+Lemma nf_ex2_term_correct : nf_ex2_term = Lam (Var 0).
+Proof. reflexivity. Qed.
+
+Definition ex3_term := App (Lam (Var 0)) (Var 1).
+
+Lemma ex3_term_tp T T' : typed [T; T'] ex3_term T'.
+Proof. repeat econstructor. Defined.
+
+Definition nf_ex3_term T T' := projT1 (nf (ex3_term_tp T T')).
+
+Lemma nf_ex3_open_term_correct_1 :
+  nf_ex3_term Un (Arr Un Un) = Lam (App (Var 2) (Var 0)).
+Proof. reflexivity. Qed.
+
+Lemma nf_ex3_open_term_correct_2 :
+  nf_ex3_term Un (Arr Un (Arr Un Un)) = Lam (Lam (App (App (Var 3) (Var 1)) (Var 0))).
 Proof. reflexivity. Qed.

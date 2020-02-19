@@ -1,9 +1,18 @@
+From Coq.micromega Require Import Lia.
 From Coq.ssr Require Export ssreflect.
-Global Set SsrOldRewriteGoalsOrder.
-From stdpp Require Import base list option proof_irrel.
+From Coq.Unicode Require Export Utf8.
+From Coq.Lists Require Import List.
 From Autosubst Require Import Autosubst.
+Require Import Equations.Equations.
 
-Ltac done := stdpp.tactics.done.
+Import Compare_dec.
+
+Import ListNotations.
+
+Set Equations Transparent.
+
+Derive NoConfusion for nat.
+Derive NoConfusion for list.
 
 Section Autosubst_Lemmas.
   Context {term : Type} {Ids_term : Ids term}
@@ -14,14 +23,725 @@ Section Autosubst_Lemmas.
     upn m f x = match lt_dec x m with left _ => ids x | right _ => rename (+m) (f (x - m)) end.
   Proof.
     revert x; induction m as [|m IH]; intros [|x];
-      repeat (case_match || asimpl || rewrite IH); auto with omega.
+      repeat (destruct lt_dec || asimpl || rewrite IH); auto; lia.
+  Qed.
+End Autosubst_Lemmas.
+
+Class Base_Domain :=
+  { UnitDom : Type
+  }.
+
+Class Base_Elems `{!Base_Domain} :=
+  { UnitElem : UnitDom
+  }.
+
+Inductive term : Type :=
+| Var : var → term
+| un : term
+| App : term → term → term
+| Lam : {bind term} → term.
+
+Derive NoConfusion for term.
+
+Instance Ids_term : Ids term. derive. Defined.
+Instance Rename_term : Rename term. derive. Defined.
+Instance Subst_term : Subst term. derive. Defined.
+Instance SubstLemmas_term : SubstLemmas term. derive. Qed.
+
+Inductive type : Type :=
+  Un
+| Arr : type → type → type.
+
+Global Instance type_eqdec : EqDec type.
+Proof. intros ??; decide equality. Defined.
+
+Definition ctx := list type.
+
+Inductive typed : ctx → term → type → Type :=
+| TVarO Γ T : typed (T :: Γ) (Var 0) T
+| TVarS Γ x T T' : typed Γ (Var x) T → typed (T' :: Γ) (Var (S x)) T
+| TUnit Γ : typed Γ un Un
+| TLam Γ t S T : typed (S :: Γ) t T → typed Γ (Lam t) (Arr S T)
+| TApp Γ t t' S T : typed Γ t (Arr S T) → typed Γ t' S → typed Γ (App t t') T.
+
+Lemma typed_weaken_var Δ1 Δ2 Δ3 x T :
+  typed (Δ1 ++ Δ3) (Var x) T →
+  typed (Δ1 ++ Δ2 ++ Δ3) (Var x).[upn (length Δ1) (ren (+ length Δ2))] T.
+Proof.
+  asimpl.
+  rewrite iter_up.
+  destruct lt_dec as [Hx|Hx]; simpl.
+  - revert x Hx Δ2 Δ3. induction Δ1; simpl in *; intros x Hx Δ2 Δ3.
+    { exfalso; lia. }
+    destruct x.
+    + inversion 1; constructor.
+    + inversion 1; subst.
+      constructor.
+      apply IHΔ1; last assumption.
+      lia.
+  - revert x Hx Δ2 Δ3. induction Δ1; simpl in *; intros x Hx Δ2 Δ3.
+    + rewrite PeanoNat.Nat.sub_0_r.
+      induction Δ2; simpl; first by trivial.
+      intros.
+      constructor; auto.
+    + intros Htp.
+      destruct x; first (exfalso; lia).
+      inversion Htp; subst.
+      constructor.
+      apply IHΔ1; last by auto.
+      lia.
+Qed.
+
+Lemma typed_weaken Δ1 Δ2 Δ3 t T :
+  typed (Δ1 ++ Δ3) t T →
+  typed (Δ1 ++ Δ2 ++ Δ3) t.[upn (length Δ1) (ren (+ length Δ2))] T.
+Proof.
+  intros Htp.
+  remember (Δ1 ++ Δ3) as Π.
+  revert Δ1 Δ2 Δ3 HeqΠ.
+  induction Htp; intros Δ1 Δ2 Δ3 HeqΠ.
+  - apply typed_weaken_var.
+    rewrite -HeqΠ; constructor.
+  - apply typed_weaken_var.
+    by rewrite -HeqΠ; constructor.
+  - constructor.
+  - asimpl.
+    econstructor.
+    eapply (IHHtp (_ :: _)).
+    by rewrite HeqΠ.
+  - asimpl.
+    econstructor.
+    + by apply IHHtp1.
+    + by apply IHHtp2.
+Qed.
+
+Derive Signature for typed.
+
+Fixpoint type_interp `{!Base_Domain} (T : type) : Type :=
+  match T with
+  | Un => UnitDom
+  | Arr W W' => (type_interp W) → (type_interp W')
+  end.
+
+Fixpoint ctx_interp_type `{!Base_Domain} Γ : Type :=
+  match Γ with
+  | [] => Datatypes.unit
+  | T :: Γ' => (type_interp T) * ctx_interp_type Γ'
+  end.
+
+Equations interp `{!Base_Domain, !Base_Elems}
+          Γ (ρ : ctx_interp_type Γ) t T (Ht : typed Γ t T) : type_interp T :=
+interp Γ ρ (Var 0) T (TVarO _ _) := fst ρ;
+interp (T' :: Γ) ρ (Var (S x)) T (TVarS Γ x T T' Hx) :=
+  interp Γ (snd ρ) (Var x) T Hx;
+interp Γ ρ un T (TUnit _) := UnitElem;
+interp Γ ρ (Lam t) _ (TLam Γ t T1 T2 Ht) := λ a, interp (T1 :: Γ) (a, ρ) _ _ Ht;
+interp Γ ρ (App t1 t2) T (TApp Γ t1 t2 T1 T2 Ht1 Ht2) :=
+  (interp _ _ _ _ Ht1) (interp _ _ _ _ Ht2).
+
+Inductive NF : ctx → term → type → Prop :=
+  NF_unit Γ : NF Γ un Un
+| NE_NF Γ t : NE Γ t Un → NF Γ t Un
+| NF_Lam Γ t S T : NF (S :: Γ) t T → NF Γ (Lam t) (Arr S T)
+with
+NE : ctx → term → type → Prop :=
+  NE_varO Γ T : NE (T :: Γ) (Var 0) T
+| NE_varS Γ x T T' : NE Γ (Var x) T → NE (T' :: Γ) (Var (S x)) T
+| NE_App Γ t t' S T : NE Γ t (Arr S T) → NF Γ t' S → NE Γ (App t t') T.
+
+Arguments NE_NF {_ _}.
+Arguments NF_Lam {_ _ _ _} _.
+Arguments NE_App {_ _ _ _ _} _ _.
+
+Definition NFtype T := ∀ Γ, sigT (λ t, NF Γ t T).
+Definition NEtype T := ∀ Γ, option (sigT (λ t, NE Γ t T))%type.
+
+Definition NFinterp (T : type) : Type :=
+  let _ := {| UnitDom := (NFtype Un) |} in type_interp T.
+
+Equations is_prefix (Δ Γ : ctx) : option ctx :=
+is_prefix [] Γ := Some Γ;
+is_prefix (T :: Δ) [] := None;
+is_prefix (T :: Δ) (T' :: Γ) :=
+  match eq_dec T T' with
+  | left _ => is_prefix Δ Γ
+  | right _ => None
+  end.
+
+Lemma is_prefix_correct Δ Γ Ξ : is_prefix Δ Γ = Some Ξ → Γ = Δ ++ Ξ.
+Proof.
+  revert Γ; induction Δ; intros Γ.
+  - inversion 1; reflexivity.
+  - destruct Γ; simpl; first (inversion 1; fail).
+    destruct eq_dec; last (inversion 1; fail).
+    subst.
+    intros HΔ.
+    rewrite (IHΔ Γ HΔ).
+    trivial.
+Defined.
+
+Lemma app_nil_r {A} (l : list A) : l ++ [] = l.
+Proof.
+  induction l as [|a l IHl]; first trivial.
+  rewrite /= IHl //.
+Defined.
+
+Lemma app_assoc {A} (l1 l2 l3 : list A) : l1 ++ l2 ++ l3 = (l1 ++ l2) ++ l3.
+Proof.
+  revert l2 l3; induction l1 as [|a1 l1 IHl1]; intros l2 l3.
+  - reflexivity.
+  - rewrite /= IHl1 //.
+Defined.
+
+(* Lemma app_cons {A} (l l' : list A) (a : A) : l ++ a :: l' = (l ++ [a]) ++ l'. *)
+(* Proof. *)
+(*   induction l as [|b l IHl]; first reflexivity. *)
+(*   rewrite /= IHl //. *)
+(* Defined. *)
+
+Lemma add_zero x : x + 0 = x.
+Proof. induction x as [|x IHx]; first reflexivity. rewrite -IHx //. Defined.
+
+Lemma Succ_add x y : S (x + y) = x + S y.
+Proof.
+  revert y; induction x; simpl; intros y; first reflexivity.
+  rewrite IHx //.
+Defined.
+
+(* Lemma add_comm x y : x + y = y + x. *)
+(* Proof. *)
+(*   revert y; induction x as [|x IHx]; intros y. *)
+(*   - rewrite add_zero //. *)
+(*   - rewrite /= IHx Succ_add //. *)
+(* Defined. *)
+
+(* (* Lemma length_app_singleton {A} (l : list A) (a : A) : *) *)
+(* (*   length (l ++ [a]) = length (a :: l). *) *)
+(* (* Proof. *) *)
+(* (*   induction l as [|b l IHl]; first reflexivity. *) *)
+(* (*   rewrite /= IHl //. *) *)
+(* (* Defined. *) *)
+
+(* Lemma NE_var_lift Γ Δ x T : NE Γ (Var x) T → NE (Γ ++ Δ) (Var (length Δ + x)) T. *)
+(* Proof. *)
+(*   revert Γ x; induction Δ as [|T' Δ IHΔ]; intros Γ x. *)
+(*   - rewrite app_nil_r; trivial. *)
+(*   - rewrite app_cons /= Succ_add. *)
+(*     intros. *)
+(*     apply (IHΔ (Γ ++ [T']) (S x)). *)
+
+Lemma rev_app {A} (l l' : list A) : rev (l ++ l') = rev l' ++ rev l.
+Proof.
+  revert l'; induction l as [|a l IHl]; intros l'.
+  - rewrite /= app_nil_r //.
+  - rewrite /= IHl app_assoc //.
+Defined.
+
+Lemma rev_involutive {A} (l : list A) : rev (rev l) = l.
+Proof.
+  induction l; simpl; trivial.
+  rewrite rev_app IHl //.
+Defined.
+
+Lemma length_app {A} (l l' : list A) : length (l ++ l') = length l + length l'.
+Proof.
+  induction l as [|a l IHl]; first reflexivity.
+  rewrite /= IHl //.
+Defined.
+
+Lemma rev_length {A} (l : list A) : length (rev l) = length l.
+Proof.
+  induction l as [|a l IHl]; first reflexivity.
+  rewrite /= length_app IHl -Succ_add add_zero //.
+Defined.
+
+Equations NE_var_lift {Δ x T} Ξ :
+  NE Δ (Var x) T → NE (Ξ ++ Δ) (Var (length Ξ + x)) T :=
+  NE_var_lift [] Hx := Hx;
+  NE_var_lift (T :: Ξ') Hx := NE_varS _ _ _ _ (NE_var_lift Ξ' Hx).
+
+Lemma var_conv {Γ Δ x T Ξ} :
+  is_prefix (rev Δ) (rev Γ) = Some Ξ →
+  NE Δ (Var x) T →
+  NE Γ (Var (length (rev Ξ) + x)) T.
+Proof.
+  intros Heq.
+  rewrite -(rev_involutive Γ).
+  rewrite (f_equal (@rev type) (is_prefix_correct _ _ _ Heq)).
+  rewrite rev_app rev_involutive.
+  apply NE_var_lift.
+Defined.
+
+(* Inductive is_prefix : ctx → ctx → Type := *)
+(* | is_prefix_nil Ξ : is_prefix [] Ξ *)
+(* | is_prefix_cons T Γ Ξ : is_prefix Γ Ξ → is_prefix (T :: Γ) (T :: Ξ). *)
+
+(* Equations is_prefix_comp (Γ Ξ : ctx) : option (is_prefix Γ Ξ) := *)
+(* is_prefix_comp [] Ξ := Some (is_prefix_nil Ξ); *)
+(* is_prefix_comp (T :: Γ') [] := None; *)
+(* is_prefix_comp (T :: Γ') (T' :: Ξ') := *)
+(*   match eq_dec T T' with *)
+(*   | left heq => *)
+(*     match is_prefix_comp Γ' Ξ' with *)
+(*     | None => None *)
+(*     | Some ip => *)
+(*       match heq in _ = z return option (is_prefix (T :: Γ') (z :: Ξ')) with *)
+(*         | eq_refl => Some (is_prefix_cons T Γ' Ξ' ip) *)
+(*       end *)
+(*     end *)
+(*   | right _ => None *)
+(*   end. *)
+
+(* Inductive nth_type_is (T : type) : nat → ctx → Prop := *)
+(* | nth_type_is_here Γ : nth_type_is T 0 (T :: Γ) *)
+(* | nth_type_is_there n T' Γ : nth_type_is T n Γ → nth_type_is T (S n) (T' :: Γ). *)
+
+(* Equations NE_variable_is_prefix T (x : var) (Γ Ξ : ctx) : *)
+(*   is_prefix Γ Ξ → nth_type_is T x Γ → option {t : term & NE Γ t T} := *)
+(* NE_variable_is_prefix T x (T :: Γ) Ξ (nth_type_is_here Γ) := _. *)
+(* NE_variable T (S _) [] Hx Ξ := _; *)
+(* NE_variable T 0 (T' :: Γ) Hx [] := None; *)
+(* NE_variable T 0 (T' :: Γ) Hx (T'' :: Ξ) := *)
+(*   match eq_dec T' T'' with *)
+(*   | left heq => *)
+(*     match (eq_trans (eq_sym (Some_eq Hx)) heq) in _ = u return *)
+(*           option {t : term & NE (u :: Ξ) t T} with *)
+(*     | eq_refl => (Some (existT (λ t, NE (T :: Ξ) t T) (Var 0) (NE_varO Ξ T))) *)
+(*     end *)
+(*   | right _ => None *)
+(*   end; *)
+(* NE_variable T (S x) (T' :: Γ) Hx [] := None; *)
+(* NE_variable T (S x) (T' :: Γ) Hx (T'' :: Ξ) := *)
+(*   match eq_dec T' T'' with *)
+(*   | left heq => *)
+(*     match NE_variable T x Γ Hx Ξ with *)
+(*     | None => None *)
+(*     | Some (existT _ t Ht) => _ *)
+(*     end *)
+(*   | right _ => None *)
+(*   end *)
+(*   (* _ (NE_variable T x Γ Hx Ξ) *). *)
+(* Next Obligation. *)
+
+
+(* Equations NE_variable T (x : var) (Γ : ctx) : *)
+(*     nth_error Γ x = Some T → NEtype T := *)
+(* NE_variable T 0 [] Hx Ξ := _; *)
+(* NE_variable T (S _) [] Hx Ξ := _; *)
+(* NE_variable T 0 (T' :: Γ) Hx [] := None; *)
+(* NE_variable T 0 (T' :: Γ) Hx (T'' :: Ξ) := *)
+(*   match eq_dec T' T'' with *)
+(*   | left heq => *)
+(*     match (eq_trans (eq_sym (Some_eq Hx)) heq) in _ = u return *)
+(*           option {t : term & NE (u :: Ξ) t T} with *)
+(*     | eq_refl => (Some (existT (λ t, NE (T :: Ξ) t T) (Var 0) (NE_varO Ξ T))) *)
+(*     end *)
+(*   | right _ => None *)
+(*   end; *)
+(* NE_variable T (S x) (T' :: Γ) Hx [] := None; *)
+(* NE_variable T (S x) (T' :: Γ) Hx (T'' :: Ξ) := *)
+(*   match eq_dec T' T'' with *)
+(*   | left heq => *)
+(*     match NE_variable T x Γ Hx Ξ with *)
+(*     | None => None *)
+(*     | Some (existT _ t Ht) => _ *)
+(*     end *)
+(*   | right _ => None *)
+(*   end *)
+(*   (* _ (NE_variable T x Γ Hx Ξ) *). *)
+(* Next Obligation. *)
+
+
+(* Definition Some_eq {A} {x y : A} : Some x = Some y → x = y := *)
+(*   λ H, *)
+(*   match H in _ = z return x = (λ u, match u with | Some t => t | None => x end) z with *)
+(*     eq_refl => eq_refl *)
+(*   end. *)
+
+(* Equations NE_variable T (x : var) (Γ : ctx) : *)
+(*     nth_error Γ x = Some T → NEtype T := *)
+(* NE_variable T 0 [] Hx Ξ := _; *)
+(* NE_variable T (S _) [] Hx Ξ := _; *)
+(* NE_variable T 0 (T' :: Γ) Hx [] := None; *)
+(* NE_variable T 0 (T' :: Γ) Hx (T'' :: Ξ) := *)
+(*   match eq_dec T' T'' with *)
+(*   | left heq => *)
+(*     match (eq_trans (eq_sym (Some_eq Hx)) heq) in _ = u return *)
+(*           option {t : term & NE (u :: Ξ) t T} with *)
+(*     | eq_refl => (Some (existT (λ t, NE (T :: Ξ) t T) (Var 0) (NE_varO Ξ T))) *)
+(*     end *)
+(*   | right _ => None *)
+(*   end; *)
+(* NE_variable T (S x) (T' :: Γ) Hx [] := None; *)
+(* NE_variable T (S x) (T' :: Γ) Hx (T'' :: Ξ) := *)
+(*   match eq_dec T' T'' with *)
+(*   | left heq => *)
+(*     match NE_variable T x Γ Hx Ξ with *)
+(*     | None => None *)
+(*     | Some (existT _ t Ht) => _ *)
+(*     end *)
+(*   | right _ => None *)
+(*   end *)
+(*   (* _ (NE_variable T x Γ Hx Ξ) *). *)
+
+(* Definition NE_variable T (x : var) (Γ : ctx) : *)
+(*     nth_error Γ x = Some T → NEtype T. *)
+(* Admitted. *)
+
+Definition NE_variable {Γ x T} : NE Γ (Var x) T → NEtype T :=
+  λ Hx Δ,
+  match is_prefix (rev Γ) (rev Δ) as u return
+        is_prefix (rev Γ) (rev Δ) = u → option {t : term & NE Δ t T}
+  with
+  | Some _ => λ heq, Some (existT _ _ (var_conv heq Hx))
+  | None => λ _, None
+  end eq_refl.
+
+Equations reflect T (neT : NEtype T) : NFinterp T := {
+reflect Un neT :=
+  λ Γ, match neT Γ with
+       | None => existT _ un (NF_unit Γ)
+       | Some ne => existT _ (projT1 ne) (NE_NF (projT2 ne))
+       end;
+reflect (Arr T1 T2) neT :=
+  λ nfT1 : NFinterp T1,
+    reflect
+      T2
+      (λ Γ, match neT Γ with
+            | None => None
+            | Some ne =>
+              let r := (reify T1 nfT1 Γ) in
+              Some
+                (existT
+                   _
+                   (App (projT1 ne) (projT1 r))
+                   (NE_App (projT2 ne) (projT2 r)))
+            end)
+}
+with
+reify T (t : NFinterp T) : NFtype T := {
+reify Un := λ nf, nf;
+reify (Arr T1 T2) :=
+  λ f Γ,
+  let r := reify T2 (f (reflect T1 (NE_variable (NE_varO Γ T1)))) (T1 :: Γ) in
+  existT _ (Lam (projT1 r)) (NF_Lam (projT2 r))
+}.
+
+Fixpoint reflect_ctx_rec (Δ Ξ : ctx) :
+    let _ := {| UnitDom := (NFtype Un) |} in
+    ctx_interp_type Ξ :=
+  match Ξ as u return ctx_interp_type u with
+  | [] => tt
+  | (T :: Ξ') =>
+    (reflect T (NE_variable (NE_var_lift Δ (NE_varO Ξ' T))),
+     reflect_ctx_rec (Δ ++ [T]) Ξ')
+  end.
+
+Definition reflect_ctx Γ := reflect_ctx_rec [] Γ.
+
+Definition interp_with_reflected_ctx {Γ t T} :
+  typed Γ t T → @type_interp {| UnitDom := (NFtype Un) |} T :=
+  let BD := {| UnitDom := (NFtype Un) |} in
+  let BE := Build_Base_Elems BD (λ Γ, existT _ un (NF_unit Γ)) in
+  @interp BD BE _ (reflect_ctx Γ) _ _.
+
+Definition nf {Γ t T} (Htp : typed Γ t T) : sigT (λ t, NF Γ t T) :=
+  reify T (interp_with_reflected_ctx Htp) Γ.
+
+Definition ex_term := App (Lam (Var 0)) un.
+
+Lemma ex_term_tp : typed [] ex_term Un.
+Proof. repeat econstructor. Defined.
+
+Definition nf_ex_term := projT1 (nf ex_term_tp).
+
+Lemma nf_ex_term_correct : nf_ex_term = un.
+Proof. reflexivity. Qed.
+
+Definition ex2_term := App (Lam (App (Lam (Var 0)) (Var 0))) (Lam (Var 0)).
+
+Lemma ex2_term_tp : typed [] ex2_term (Arr Un Un).
+Proof. repeat econstructor. Defined.
+
+Definition nf_ex2_term := projT1 (nf ex2_term_tp).
+
+Lemma nf_ex2_term_correct : nf_ex2_term = Lam (Var 0).
+Proof. reflexivity. Qed.
+
+Definition ex3_term := App (Lam (Var 0)) (Var 1).
+
+Lemma ex3_term_tp T T' : typed [T; T'] ex3_term T'.
+Proof. repeat econstructor. Defined.
+
+Definition nf_ex3_term T T' := projT1 (nf (ex3_term_tp T T')).
+
+Lemma nf_ex3_open_term_correct_1 :
+  nf_ex3_term Un (Arr Un Un) = Lam (App (Var 2) (Var 0)).
+Proof. reflexivity. Qed.
+
+Lemma nf_ex3_open_term_correct_2 :
+  nf_ex3_term Un (Arr Un (Arr Un Un)) = Lam (Lam (App (App (Var 3) (Var 1)) (Var 0))).
+Proof. reflexivity. Qed.
+
+Inductive beta_eta : ctx → term → term → type → Type :=
+| BE_refl Γ t T : beta_eta Γ t t T
+| BE_trans Γ t1 t2 t3 T : beta_eta Γ t1 t2 T → beta_eta Γ t2 t3 T →
+  beta_eta Γ t1 t3 T
+| BE_symm Γ t1 t2 T : beta_eta Γ t1 t2 T → beta_eta Γ t2 t1 T
+| BE_beta Γ t1 t2 T : beta_eta Γ (App (Lam t1) t2) (t1.[t2/]) T
+| BE_eta Γ t T1 T2 : beta_eta Γ t (Lam (App t.[ren (+1)] (Var 0))) (Arr T1 T2)
+| BE_app_L Γ t1 t1' t2 T1 T2 : beta_eta Γ t1 t1' (Arr T1 T2) →
+                            beta_eta Γ (App t1 t2) (App t1' t2) T2
+| BE_app_R Γ t1 t2 t2' T1 T2 : beta_eta Γ t2 t2' T1 →
+                            beta_eta Γ (App t1 t2) (App t1 t2') T2
+| BE_lam Γ t1 t2 T1 T2 : beta_eta (T1 :: Γ) t1 t2 T2 →
+                            beta_eta Γ (Lam t1) (Lam t2) (Arr T1 T2).
+
+Lemma beta_eta_typed Γ t t' T :
+  beta_eta Γ t t' T → (typed Γ t T → typed Γ t' T) * (typed Γ t' T → typed Γ t T).
+Proof.
+  intros Hbe.
+  induction Hbe.
+  - intuition.
+  - intuition.
+  - intuition.
+  - split.
+    + intros Htp.
+      inversion Htp; subst.
+      inversion X; subst.
+      
+
+
+Lemma beta_eta_weaken Δ1 Δ2 Δ3 t t' T :
+  beta_eta (Δ1 ++ Δ3) t t' T →
+  beta_eta (Δ1 ++ Δ2 ++ Δ3)
+           t.[upn (length Δ1) (ren (+ length Δ2))]
+           t'.[upn (length Δ1) (ren (+ length Δ2))]
+           T.
+Proof.
+  intros Hbe.
+  remember (Δ1 ++ Δ3) as Π.
+  revert Δ1 Δ2 Δ3 HeqΠ.
+  induction Hbe; intros Δ1 Δ2 Δ3 HeqΠ.
+  - apply BE_refl.
+  - eapply BE_trans; eauto.
+  - eapply BE_symm; auto.
+  - replace (App (Lam t1) t2).[upn (length Δ1) (ren (+length Δ2))] with
+        (App (Lam t1.[upn (S (length Δ1)) (ren (+length Δ2))])
+             t2.[upn (length Δ1) (ren (+length Δ2))]); last by asimpl.
+    replace t1.[t2/].[upn (length Δ1) (ren (+length Δ2))] with
+    t1.[upn (S (length Δ1)) (ren (+length Δ2))]
+       .[t2.[upn (length Δ1) (ren (+length Δ2))]/]; last by asimpl.
+    apply BE_beta.
+  - replace (Lam (App t.[ren (+1)] (Var 0))).[upn (length Δ1) (ren (+length Δ2))]
+      with (Lam (App t.[upn (length Δ1) (ren (+length Δ2))].[ren (+1)] (Var 0)));
+      last by asimpl.
+    apply BE_eta.
+  - asimpl.
+    eapply BE_app_L; first by auto.
+  - asimpl.
+    eapply BE_app_R; last by auto.
+  - asimpl.
+    apply BE_lam.
+    apply (IHHbe (_ :: _)).
+    by rewrite HeqΠ.
+Qed.
+
+Definition term_nfinterp_pair Γ T : Type :=
+  {t : term & typed Γ t T} * NFinterp T.
+
+Program Fixpoint logrel (Γ : ctx) (T : type) (ta : term_nfinterp_pair Γ T) : Prop :=
+  match T as u return (term_nfinterp_pair Γ u) → Prop with
+  | Un => λ x,
+         ∀ Γ', beta_eta (Γ' ++ Γ) (projT1 (fst ta)).[ren (+ length Γ')]
+                          (projT1 (reify _ (snd x) (Γ' ++ Γ))) Un
+  | Arr T1 T2 =>
+    λ f, ∀ Γ' ta',
+        logrel (Γ' ++ Γ) T1 ta' →
+        logrel (Γ' ++ Γ)
+               T2
+               (existT
+                  _
+                  (App (projT1 (fst f)).[ren (+ length Γ')]
+                                           (projT1 (fst ta')))
+                  (TApp _ _ _ _ _
+                        (typed_weaken [] _ _ _ _ (projT2 (fst f)))
+                        (projT2 (fst ta'))), (snd f) (snd ta'))
+  end ta.
+
+Fixpoint term_interp_pairs (Γ : ctx) (Δ : ctx) : Type :=
+  match Δ with
+  | nil => unit
+  | T :: Δ' => {x : term_nfinterp_pair Γ T | logrel Γ T x}
+             * term_interp_pairs Γ Δ'
+  end.
+
+Fixpoint subst_of {Γ Δ} (ts : term_interp_pairs Γ Δ) : var → term :=
+  match Δ as u return term_interp_pairs Γ u → var → term with
+  | [] => λ _, ids
+  | T :: Δ' => λ ts', projT1 (fst (proj1_sig (fst ts'))) .: (subst_of (snd ts'))
+  end ts.
+
+Fixpoint ctx_interp_of {Γ Δ} (ts : term_interp_pairs Γ Δ) : ctx_interp_type Δ :=
+  match Δ as u return term_interp_pairs Γ u → ctx_interp_type u with
+  | [] => λ _, tt
+  | T :: Δ' => λ ts', (snd (proj1_sig (fst ts')), ctx_interp_of (snd ts'))
+  end ts.
+
+  (* let BD := {| UnitDom := (NFtype Un) |} in *)
+  (* let BE := Build_Base_Elems BD (λ Γ, existT un (NF_unit Γ)) in *)
+  (* @term_interp BD BE _ (reflect_ctx Γ) _ _ *)
+
+(* Axiom UIP : ∀ {T : Type} {x : T} (e : x = x), e = eq_refl. *)
+
+Lemma logrel_closed_under_beta_eta Γ T t t' a :
+  beta_eta Γ (projT1 t) (projT1 t') T → logrel Γ T (t, a) → logrel Γ T (t', a).
+Proof.
+  revert Γ t t' a.
+  induction T.
+  - intros Γ t t' a Hbe Hta Γ'.
+    specialize (Hta Γ').
+    simpl in *.
+    eapply BE_trans; last eauto.
+    apply BE_symm.
+    by apply (beta_eta_weaken []).
+  - simpl in *.
+    intros Γ t t' a Hbe Hta Γ' ta' Hta'.
+    eapply IHT2; last by eauto.
+    eapply BE_app_L.
+    + apply (beta_eta_weaken []); eauto.
+    + apply (projT2 (fst ta')).
+Qed.
+
+Lemma logrel_subst
+      Ξ1 Ξ2 t T (Htp : typed (Ξ1 ++ Ξ2) t T) Δ (ts : term_interp_pairs Δ Ξ2) :
+  typed (Ξ1 ++ Δ) t.[upn (length Ξ1) (subst_of ts)] T.
+Proof.
+  remember (Ξ1 ++ Ξ2) as Ξ.
+  revert Ξ1 Ξ2 Δ ts HeqΞ.
+  induction Htp; intros Ξ1 Ξ2 Δ ts HeqΞ.
+  - asimpl.
+    destruct Ξ1; inversion HeqΞ; subst; asimpl.
+    + destruct Ξ2; inversion HeqΞ; subst.
+      destruct ts as [[u ?] ?]; simpl.
+      apply (projT2 (fst u)).
+    + constructor.
+  - asimpl.
+    destruct Ξ1; inversion HeqΞ; subst; asimpl.
+    + destruct Ξ2; inversion HeqΞ; subst.
+      destruct ts as [? ts']; simpl.
+      simpl in *.
+      by apply (IHHtp []).
+    + apply (typed_weaken [] [_]); simpl.
+      by apply IHHtp.
+  - constructor.
+  - simpl; constructor.
+    apply (IHHtp (_ :: _)).
+    by rewrite HeqΞ.
+  - asimpl.
+    econstructor; eauto.
+Qed.
+
+Lemma fundamental Γ t T (Htp : typed Γ t T) :
+  ∀ Δ (ts : term_interp_pairs Δ Γ) Htp',
+    logrel Δ T ((existT _ t.[subst_of ts] Htp'),
+                let BD := {| UnitDom := (NFtype Un) |} in
+                let BE := Build_Base_Elems BD (λ Γ, existT _ un (NF_unit Γ)) in
+                @interp BD BE _ (ctx_interp_of ts) t T Htp).
+Proof.
+  induction Htp; simpl in *.
+  - intros Δ ts.
+    rewrite /apply_noConfusion /=.
+    pose proof (proj2_sig (fst ts)) as Hx; simpl in *.
+    revert Hx. case: (proj1_sig (fst ts)); simpl; auto.
+  - asimpl.
+    intros Δ ts.
+    apply IHHtp.
+  - intros Δ ts Γ'.
+    constructor.
+  - asimpl.
+    intros Δ ts Γ' ta' Hta'.
+    
+
+
+  - intros Δ ts.
+    revert dependent x.
+    induction Γ; asimpl; first done.
+    intros x e.
+    destruct x.
+    + simpl in *; inversion e; simplify_eq.
+      destruct ts as [[[] []] ?]; simpl in *.
+      rewrite (UIP e) //=.
+    + simpl in *.
+      destruct ts; simpl in *.
+      apply IHΓ.
+  - intros; constructor.
+  - 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Section Autosubst_Lemmas.
+  Context {term : Type} {Ids_term : Ids term}
+          {Rename_term : Rename term} {Subst_term : Subst term}
+          {SubstLemmas_term : SubstLemmas term}.
+
+  Lemma iter_up (m x : nat) (f : var → term) :
+    upn m f x = match lt_dec x m with left _ => ids x | right _ => rename (+m) (f (x - m)) end.
+  Proof.
+    revert x; induction m as [|m IH]; intros [|x];
+      repeat (destruct lt_dec || asimpl || rewrite IH); auto with lia.
   Qed.
 End Autosubst_Lemmas.
 
 Definition f_equal {A B} (f : A → B) {x y : A} : x = y → f x = f y :=
   λ H, match H in _ = u return f x = f u with eq_refl => eq_refl end.
 
-Program Definition Some_inj {A} : Inj (=) (=) (@Some A) :=
+Definition Some_inj {A} : Inj (=) (=) (@Some A) :=
   λ x y H, f_equal (λ u, match u with Some w => w | None => x end) H.
 
 Section list_ops.
@@ -444,7 +1164,7 @@ Definition interp_with_reflected_ctx {Γ t T} :
   typed Γ t T → @type_interp {| UnitDom := (NFtype Un) |} T :=
   let BD := {| UnitDom := (NFtype Un) |} in
   let BE := Build_Base_Elems BD (λ Γ, existT un (NF_unit Γ)) in
-  λ Htp, @term_interp BD BE _ (reflect_ctx Γ) _ _ Htp.
+  @term_interp BD BE _ (reflect_ctx Γ) _ _.
 
 Definition nf {Γ t T} (Htp : typed Γ t T) : sigT (λ t, NF Γ t T) :=
   reify T (interp_with_reflected_ctx Htp) Γ.
@@ -483,3 +1203,75 @@ Proof. reflexivity. Qed.
 Lemma nf_ex3_open_term_correct_2 :
   nf_ex3_term Un (Arr Un (Arr Un Un)) = Lam (Lam (App (App (Var 3) (Var 1)) (Var 0))).
 Proof. reflexivity. Qed.
+
+Inductive beta_eta : ctx → term → term → type → Prop :=
+| BE_refl Γ t T : beta_eta Γ t t T
+| BE_trans Γ t1 t2 t3 T : beta_eta Γ t1 t2 T → beta_eta Γ t2 t3 T →
+  beta_eta Γ t1 t3 T
+| BE_symm Γ t1 t2 T : beta_eta Γ t1 t2 T → beta_eta Γ t2 t1 T
+| BE_beta Γ t1 t2 T : beta_eta Γ (App (Lam t1) t2) (t1.[t2/]) T
+| BE_eta Γ t T1 T2 : beta_eta Γ t (Lam (App t (Var 0))) (Arr T1 T2)
+| BE_app_L Γ t1 t1' t2 T1 T2 : beta_eta Γ t1 t1' (Arr T1 T2) → typed Γ t2 T1 →
+                            beta_eta Γ (App t1 t2) (App t1' t2) T2
+| BE_app_R Γ t1 t2 t2' T1 T2 : typed Γ t1 (Arr T1 T2) → beta_eta Γ t2 t2' T1 →
+                            beta_eta Γ (App t1 t2) (App t1 t2') T2
+| under_lam Γ t1 t2 T1 T2 : beta_eta (T1 :: Γ) t1 t2 T2 →
+                            beta_eta Γ (Lam t1) (Lam t2) (Arr T1 T2).
+
+Fixpoint logrel (Γ : ctx) (T : type) (ta : term * NFinterp T) : Prop :=
+  match T as u return NFinterp u → Prop with
+  | Un => λ x, ∀ Γ', beta_eta Γ ta.1 (projT1 (reify _ x (Γ' ++ Γ))) Un
+  | Arr T1 T2 => λ f, ∀ Γ' ta', logrel (Γ' ++ Γ) T1 ta' →
+                            logrel (Γ' ++ Γ) T2 (App ta.1 ta'.1, f ta'.2)
+  end ta.2.
+
+Fixpoint term_interp_pairs (Γ : ctx) (Δ : ctx) : Type :=
+  match Δ with
+  | nil => unit
+  | T :: Δ' => {x : (term * NFinterp T) & (typed Γ x.1 T * logrel Γ T x)%type}
+             * term_interp_pairs Γ Δ'
+  end.
+
+Fixpoint subst_of {Γ Δ} (ts : term_interp_pairs Γ Δ) : var → term :=
+  match Δ as u return term_interp_pairs Γ u → var → term with
+  | [] => λ _, ids
+  | T :: Δ' => λ ts', (projT1 ts'.1).1 .: (subst_of ts'.2)
+  end ts.
+
+Fixpoint ctx_interp_of {Γ Δ} (ts : term_interp_pairs Γ Δ) : ctx_interp Δ :=
+  match Δ as u return term_interp_pairs Γ u → ctx_interp u with
+  | [] => λ _, ()
+  | T :: Δ' => λ ts', ((projT1 ts'.1).2, ctx_interp_of ts'.2)
+  end ts.
+
+  (* let BD := {| UnitDom := (NFtype Un) |} in *)
+  (* let BE := Build_Base_Elems BD (λ Γ, existT un (NF_unit Γ)) in *)
+  (* @term_interp BD BE _ (reflect_ctx Γ) _ _ *)
+
+Axiom UIP : ∀ {T : Type} {x : T} (e : x = x), e = eq_refl.
+
+Lemma fundamental Γ t T (Htp : typed Γ t T) :
+  ∀ Δ (ts : term_interp_pairs Δ Γ),
+    logrel Δ T (t.[subst_of ts],
+                let BD := {| UnitDom := (NFtype Un) |} in
+                let BE := Build_Base_Elems BD (λ Γ, existT un (NF_unit Γ)) in
+                @term_interp BD BE _ (ctx_interp_of ts) t T Htp).
+Proof.
+  induction Htp; simpl in *.
+  - intros Δ ts.
+    revert dependent x.
+    induction Γ; asimpl; first done.
+    intros x e.
+    destruct x.
+    + simpl in *; inversion e; simplify_eq.
+      destruct ts as [[[] []] ?]; simpl in *.
+      rewrite (UIP e) //=.
+    + simpl in *.
+      destruct ts; simpl in *.
+      apply IHΓ.
+  - intros; constructor.
+  - 
+
+
+
+
